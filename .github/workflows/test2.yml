@@ -38,26 +38,62 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: Install system dependencies
+      - name: Install APT dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq wget unzip curl jq openssl aapt zipalign
+          sudo apt-get install -y -qq curl wget unzip jq openssl aapt zipalign apktool
+
+      - name: Install Python packages
+        run: |
           pip install --quiet quark-engine mobsfscan requests openai
-          wget -q https://github.com/skylot/jadx/releases/download/v1.5.6/jadx-1.5.6.zip -O /tmp/jadx.zip
+
+      - name: Download JADX
+        run: |
+          set -euo pipefail
+          URL="https://github.com/skylot/jadx/releases/download/v1.5.6/jadx-1.5.6.zip"
+          echo "Downloading JADX from: $URL"
+          curl -4 -fL --retry 5 --retry-delay 3 --connect-timeout 20 -o /tmp/jadx.zip "$URL"
           unzip -q /tmp/jadx.zip -d /opt/jadx
-          wget -q https://github.com/ThexXTURBOXx/dex2jar/releases/download/v2.4.38/dex-tools-2.4.38.zip -O /tmp/dex2jar.zip
-          unzip -q /tmp/dex2jar.zip -d /opt/dex2jar
-          wget -q https://github.com/iBotPeaches/Apktool/releases/download/v3.0.3/apktool_3.0.3.jar -O /opt/apktool.jar
           chmod +x /opt/jadx/bin/jadx
+          /opt/jadx/bin/jadx --version
+
+      - name: Download dex2jar
+        run: |
+          set -euo pipefail
+          URL="https://github.com/ThexXTURBOXx/dex2jar/releases/download/v2.4.38/dex-tools-2.4.38.zip"
+          echo "Downloading dex2jar from: $URL"
+          curl -4 -fL --retry 5 --retry-delay 3 --connect-timeout 20 -o /tmp/dex2jar.zip "$URL"
+          unzip -q /tmp/dex2jar.zip -d /opt/dex2jar
           find /opt/dex2jar -name 'd2j-dex2jar.sh' -exec chmod +x {} \;
           find /opt/dex2jar -name 'd2j-dex2jar' -exec chmod +x {} \; || true
+          test -n "$(find /opt/dex2jar -name 'd2j-dex2jar.sh' -print -quit)" && echo "d2j-dex2jar.sh found"
+
+      - name: Install Apktool JAR (fallback if apt version is old)
+        run: |
+          set -euo pipefail
+          if ! command -v apktool >/dev/null 2>&1; then
+            URL="https://github.com/iBotPeaches/Apktool/releases/download/v3.0.3/apktool_3.0.3.jar"
+            echo "Apktool not found via apt, downloading JAR from: $URL"
+            curl -4 -fL --retry 5 --retry-delay 3 --connect-timeout 20 -o /opt/apktool.jar "$URL"
+            printf '#!/bin/sh\nexec java -jar /opt/apktool.jar "$@"\n' | sudo tee /usr/local/bin/apktool >/dev/null
+            sudo chmod +x /usr/local/bin/apktool
+          fi
+          apktool --version
+
+      - name: Verify tool availability
+        run: |
+          set -euo pipefail
+          echo "Java: $(java -version 2>&1 | head -n1)"
+          echo "JADX: $(/opt/jadx/bin/jadx --version)"
+          echo "Apktool: $(apktool --version)"
+          echo "dex2jar: $(find /opt/dex2jar -name 'd2j-dex2jar.sh' -print -quit)"
 
       - name: Download APK
         env:
           APK_URL: ${{ inputs.apk_url }}
         run: |
           mkdir -p artifacts/raw
-          curl -L --fail --retry 3 --retry-delay 2 -o artifacts/raw/target.apk "$APK_URL"
+          curl -fL --retry 3 --retry-delay 2 -o artifacts/raw/target.apk "$APK_URL"
           test -s artifacts/raw/target.apk
           file artifacts/raw/target.apk
           sha256sum artifacts/raw/target.apk | tee artifacts/raw/sha256.txt
@@ -97,7 +133,7 @@ jobs:
 
       - name: apktool decode resources and manifest
         run: |
-          java -jar /opt/apktool.jar d -f -o artifacts/apktool artifacts/raw/target.apk
+          apktool d -f -o artifacts/apktool artifacts/raw/target.apk
 
       - name: dex2jar conversion
         run: |
