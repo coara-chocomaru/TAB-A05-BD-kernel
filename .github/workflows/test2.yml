@@ -1,4 +1,4 @@
-name: APK Analysis
+name: APK Analysis Pipeline
 on:
   workflow_dispatch:
     inputs:
@@ -43,11 +43,12 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq wget unzip curl jq openssl apktool aapt zipalign
           pip install --quiet quark-engine mobsfscan requests openai
-          wget -q https://github.com/skylot/jadx/releases/download/v1.5.3/jadx-1.5.3.zip -O /tmp/jadx.zip
+          wget -q https://github.com/skylot/jadx/releases/download/v1.5.6/jadx-1.5.6.zip -O /tmp/jadx.zip
           unzip -q /tmp/jadx.zip -d /opt/jadx
-          wget -q https://github.com/pxb1988/dex2jar/releases/download/v2.4/dex-tools-v2.4.zip -O /tmp/dex2jar.zip
+          wget -q https://github.com/ThexXTURBOXx/dex2jar/releases/download/v2.1-SNAPSHOT/dex2jar-2.1-SNAPSHOT.zip -O /tmp/dex2jar.zip
           unzip -q /tmp/dex2jar.zip -d /opt/dex2jar
-          chmod +x /opt/jadx/bin/jadx /opt/dex2jar/d2j-dex2jar.sh
+          chmod +x /opt/jadx/bin/jadx
+          chmod +x /opt/dex2jar/*/d2j-dex2jar.sh
 
       - name: Download APK
         env:
@@ -99,9 +100,10 @@ jobs:
       - name: dex2jar conversion
         run: |
           mkdir -p artifacts/dex2jar
+          DEX2JAR_SCRIPT=$(find /opt/dex2jar -name 'd2j-dex2jar.sh' | head -n 1)
           for dex in $(unzip -Z1 artifacts/raw/target.apk | grep -E '^classes.*\.dex$'); do
             unzip -p artifacts/raw/target.apk "$dex" > /tmp/"$(basename "$dex")"
-            /opt/dex2jar/d2j-dex2jar.sh -f -o artifacts/dex2jar/"$(basename "$dex" .dex)".jar /tmp/"$(basename "$dex")"
+            "$DEX2JAR_SCRIPT" -f -o artifacts/dex2jar/"$(basename "$dex" .dex)".jar /tmp/"$(basename "$dex")"
           done
 
       - name: mobsfscan static analysis
