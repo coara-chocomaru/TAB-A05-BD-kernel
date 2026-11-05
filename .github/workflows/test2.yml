@@ -346,6 +346,34 @@ jobs:
           fi
           docker stop mobsf || true
 
+      - name: Grep keywords from JADX output
+        run: |
+          mkdir -p artifacts/grep_results
+          if [ ! -d artifacts/jadx/java ]; then
+            echo "artifacts/jadx/java not found, skipping keyword grep."
+            exit 0
+          fi
+          cd artifacts/jadx/java
+          : > ../grep_results/counts.txt
+          : > ../grep_results/all_matches.txt
+          for kw in "lock" "unlock" "password" "hidden" "sdcard/" "debug" "_code"; do
+            safe_kw=$(printf '%s' "$kw" | tr '/' '_')
+            out="../grep_results/${safe_kw}_matches.txt"
+            grep -rin --include='*.java' -F "$kw" . > "$out" 2>/dev/null || true
+            count=$(wc -l < "$out" | tr -d ' ')
+            printf '%s: %s\n' "$kw" "$count" >> ../grep_results/counts.txt
+            if [ "$count" -gt 0 ]; then
+              {
+                echo ""
+                echo "===== KEYWORD: $kw ($count matches) ====="
+                cat "$out"
+              } >> ../grep_results/all_matches.txt
+            fi
+          done
+          cd - >/dev/null
+          echo "Keyword grep summary:"
+          cat artifacts/grep_results/counts.txt
+
       - name: Generate summary
         run: |
           mkdir -p artifacts/summary
@@ -356,10 +384,17 @@ jobs:
             echo "**Java files decompiled:** $(cat artifacts/jadx/java_file_count.txt 2>/dev/null || echo 'N/A')"
             echo "**Failed methods:** $(cat artifacts/jadx/failed_methods_count.txt 2>/dev/null || echo 'N/A')"
             echo "**JADX error lines:** $(cat artifacts/jadx/jadx_error_count.txt 2>/dev/null || echo 'N/A')"
-            echo "**mobsfscan SARIF:** artifacts/mobsfscan.sarif"
-            echo "**Quark report:** artifacts/quark_report.json"
-            echo "**LLM findings:** artifacts/llm_findings.json"
-            echo "**Consolidated report:** artifacts/consolidated_report.json"
+            echo ""
+            echo "## Keyword Grep Counts"
+            cat artifacts/grep_results/counts.txt 2>/dev/null || echo "N/A"
+            echo ""
+            echo "## Artifacts"
+            echo "- mobsfscan SARIF: artifacts/mobsfscan.sarif"
+            echo "- Quark report: artifacts/quark_report.json"
+            echo "- LLM findings: artifacts/llm_findings.json"
+            echo "- Consolidated report: artifacts/consolidated_report.json"
+            echo "- Keyword matches (per keyword): artifacts/grep_results/*_matches.txt"
+            echo "- Keyword matches (combined): artifacts/grep_results/all_matches.txt"
           } > artifacts/summary/SUMMARY.md
 
       - name: Upload all artifacts
