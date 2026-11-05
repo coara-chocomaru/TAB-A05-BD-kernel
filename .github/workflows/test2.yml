@@ -60,13 +60,14 @@ jobs:
       - name: Download dex2jar
         run: |
           set -euo pipefail
-          URL="https://github.com/ThexXTURBOXx/dex2jar/releases/download/v2.4.38/dex-tools-2.4.38.zip"
+          URL="https://github.com/ThexXTURBOXx/dex2jar/releases/download/2.4.38/dex-tools-2.4.38.zip"
           echo "Downloading dex2jar from: $URL"
           curl -4 -fL --retry 5 --retry-delay 3 --connect-timeout 20 -o /tmp/dex2jar.zip "$URL"
           unzip -q /tmp/dex2jar.zip -d /opt/dex2jar
           find /opt/dex2jar -name 'd2j-dex2jar.sh' -exec chmod +x {} \;
           find /opt/dex2jar -name 'd2j-dex2jar' -exec chmod +x {} \; || true
-          test -n "$(find /opt/dex2jar -name 'd2j-dex2jar.sh' -print -quit)" && echo "d2j-dex2jar.sh found"
+          DEX2JAR_SCRIPT=$(find /opt/dex2jar -name 'd2j-dex2jar.sh' -print -quit)
+          test -n "$DEX2JAR_SCRIPT" && echo "d2j-dex2jar.sh found at: $DEX2JAR_SCRIPT"
 
       - name: Install Apktool JAR (fallback if apt version is old)
         run: |
