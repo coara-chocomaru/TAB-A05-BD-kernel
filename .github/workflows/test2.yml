@@ -1,0 +1,289 @@
+name: APK Analysis
+on:
+  workflow_dispatch:
+    inputs:
+      apk_url:
+        description: 'Target APK URL (direct link to .apk file)'
+        required: true
+        type: string
+      llm_model:
+        description: 'LLM model for code review (e.g., gpt-4o, gemini-2.5-pro)'
+        required: false
+        default: 'gpt-4o'
+        type: string
+      enable_dynamic:
+        description: 'Enable dynamic analysis (requires MobSF Docker)'
+        required: false
+        default: false
+        type: boolean
+permissions:
+  contents: read
+  actions: read
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq wget unzip curl jq openssl apktool aapt zipalign
+          pip install --quiet quark-engine mobsfscan requests openai
+          wget -q https://github.com/skylot/jadx/releases/download/v1.5.3/jadx-1.5.3.zip -O /tmp/jadx.zip
+          unzip -q /tmp/jadx.zip -d /opt/jadx
+          wget -q https://github.com/pxb1988/dex2jar/releases/download/v2.4/dex-tools-v2.4.zip -O /tmp/dex2jar.zip
+          unzip -q /tmp/dex2jar.zip -d /opt/dex2jar
+          chmod +x /opt/jadx/bin/jadx /opt/dex2jar/d2j-dex2jar.sh
+
+      - name: Download APK
+        env:
+          APK_URL: ${{ inputs.apk_url }}
+        run: |
+          mkdir -p artifacts/raw
+          curl -L --fail --retry 3 --retry-delay 2 -o artifacts/raw/target.apk "$APK_URL"
+          test -s artifacts/raw/target.apk
+          file artifacts/raw/target.apk
+          sha256sum artifacts/raw/target.apk | tee artifacts/raw/sha256.txt
+
+      - name: Collect APK metadata
+        run: |
+          mkdir -p artifacts/metadata
+          unzip -l artifacts/raw/target.apk > artifacts/metadata/zip_listing.txt
+          aapt dump badging artifacts/raw/target.apk > artifacts/metadata/badging.txt 2>&1 || true
+          aapt dump permissions artifacts/raw/target.apk > artifacts/metadata/permissions.txt 2>&1 || true
+          openssl pkcs7 -inform DER -in artifacts/raw/target.apk -print_certs -noout > artifacts/metadata/certificates.txt 2>&1 || true
+          unzip -p artifacts/raw/target.apk META-INF/*.RSA META-INF/*.DSA META-INF/*.EC 2>/dev/null | openssl pkcs7 -inform DER -print_certs -noout >> artifacts/metadata/certificates.txt 2>&1 || true
+          unzip -l artifacts/raw/target.apk | awk '/\.so$/ {print $4}' > artifacts/metadata/native_libs.txt
+
+      - name: JADX decompile to Java
+        run: |
+          mkdir -p artifacts/jadx
+          /opt/jadx/bin/jadx \
+            --no-res \
+            --show-bad-code \
+            --decompilation-mode auto \
+            --threads-count 4 \
+            --log-level error \
+            -d artifacts/jadx/java \
+            artifacts/raw/target.apk
+          find artifacts/jadx/java -name '*.java' | wc -l | tee artifacts/jadx/java_file_count.txt
+          grep -rl "Method not decompiled" artifacts/jadx/java --include=*.java | wc -l > artifacts/jadx/failed_methods_count.txt || true
+
+      - name: JADX export Gradle project
+        run: |
+          /opt/jadx/bin/jadx \
+            --no-res \
+            --export-gradle \
+            --export-gradle-type android-app \
+            -d artifacts/jadx/gradle \
+            artifacts/raw/target.apk
+
+      - name: apktool decode resources and manifest
+        run: |
+          apktool d -f -o artifacts/apktool artifacts/raw/target.apk
+
+      - name: dex2jar conversion
+        run: |
+          mkdir -p artifacts/dex2jar
+          for dex in $(unzip -Z1 artifacts/raw/target.apk | grep -E '^classes.*\.dex$'); do
+            unzip -p artifacts/raw/target.apk "$dex" > /tmp/"$(basename "$dex")"
+            /opt/dex2jar/d2j-dex2jar.sh -f -o artifacts/dex2jar/"$(basename "$dex" .dex)".jar /tmp/"$(basename "$dex")"
+          done
+
+      - name: mobsfscan static analysis
+        run: |
+          mobsfscan artifacts/raw/target.apk \
+            --sarif \
+            --output artifacts/mobsfscan.sarif \
+            --json \
+            -o artifacts/mobsfscan.json || true
+
+      - name: Quark-Engine malware analysis
+        run: |
+          quark -a artifacts/raw/target.apk -o artifacts/quark_report.json -s -t 300 || true
+
+      - name: Extract strings and search indicators
+        run: |
+          mkdir -p artifacts/strings
+          strings -n 6 artifacts/raw/target.apk > artifacts/strings/all_strings.txt
+          grep -Eo 'https?://[^"'\'' ]+' artifacts/strings/all_strings.txt | sort -u > artifacts/strings/urls.txt || true
+          grep -Ei 'api[_-]?key|secret|token|password|private[_-]?key|aws_|firebase|google_api' artifacts/strings/all_strings.txt | sort -u > artifacts/strings/secrets_candidates.txt || true
+
+      - name: LLM code review via OpenAI-compatible API
+        if: ${{ inputs.llm_model != '' }}
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          LLM_MODEL: ${{ inputs.llm_model }}
+        run: |
+          python - <<'PY'
+          import os, json, pathlib, textwrap, requests
+
+          api_key = os.environ.get("OPENAI_API_KEY")
+          model = os.environ.get("LLM_MODEL", "gpt-4o")
+          if not api_key:
+              print("OPENAI_API_KEY not set, skipping LLM review.")
+              raise SystemExit(0)
+
+          base = pathlib.Path("artifacts/jadx/java")
+          java_files = sorted(base.rglob("*.java"))
+          MAX_FILES = 40
+          MAX_CHARS_PER_FILE = 12000
+          selected = []
+          total = 0
+          for p in java_files:
+              text = p.read_text(errors="ignore")
+              if not text.strip():
+                  continue
+              snippet = text[:MAX_CHARS_PER_FILE]
+              selected.append(f"===== {p} =====\n{snippet}")
+              total += len(snippet)
+              if len(selected) >= MAX_FILES or total > 180000:
+                  break
+
+          corpus = "\n\n".join(selected)
+          prompt = textwrap.dedent(f"""
+          You are a senior Android security auditor. Analyze the following decompiled Java code from an APK.
+          Focus on OWASP Mobile Top 10: insecure data storage, insecure communication, insecure authentication,
+          insufficient cryptography, insecure IPC, client-side injection, code tampering, extraneous functionality,
+          reverse engineering, and insecure permissions.
+          Return a JSON object with keys: findings (array), risk_summary (string), high_priority_classes (array).
+          Each finding must have: title, severity (CRITICAL/HIGH/MEDIUM/LOW), class, method, description, recommendation.
+          Here is the code corpus:
+          {corpus}
+          """)
+
+          headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+          payload = {
+              "model": model,
+              "messages": [{"role": "user", "content": prompt}],
+              "temperature": 0.2,
+              "response_format": {"type": "json_object"},
+          }
+          r = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=payload, timeout=300)
+          r.raise_for_status()
+          content = r.json()["choices"][0]["message"]["content"]
+          pathlib.Path("artifacts/llm_findings.json").write_text(content, encoding="utf-8")
+          print("LLM review saved to artifacts/llm_findings.json")
+          PY
+
+      - name: LLM SAST aggregation and triage
+        if: ${{ inputs.llm_model != '' }}
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          LLM_MODEL: ${{ inputs.llm_model }}
+        run: |
+          python - <<'PY'
+          import os, json, pathlib, textwrap, requests
+
+          api_key = os.environ.get("OPENAI_API_KEY")
+          model = os.environ.get("LLM_MODEL", "gpt-4o")
+          if not api_key:
+              raise SystemExit(0)
+
+          def load(path, default):
+              p = pathlib.Path(path)
+              return p.read_text(errors="ignore") if p.exists() else default
+
+          mobsf = load("artifacts/mobsfscan.json", "{}")
+          quark = load("artifacts/quark_report.json", "{}")
+          llm = load("artifacts/llm_findings.json", "{}")
+          urls = load("artifacts/strings/urls.txt", "")
+          secrets = load("artifacts/strings/secrets_candidates.txt", "")
+
+          prompt = textwrap.dedent(f"""
+          You are aggregating multiple Android APK analysis sources.
+          Inputs:
+          - mobsfscan JSON (top-level truncated): {mobsf[:20000]}
+          - Quark-Engine JSON (truncated): {quark[:20000]}
+          - LLM code review JSON: {llm[:30000]}
+          - Extracted URLs (sample): {urls[:8000]}
+          - Secret candidates (sample): {secrets[:8000]}
+          Produce a single consolidated JSON report with:
+          - meta: {{tool, timestamp, overall_risk}}
+          - findings: array of unique findings with source(s), severity, confidence, description, remediation
+          - attack_surface: {{exported_components, deep_links, native_libs}}
+          - secrets_and_urls: {{suspicious_urls, potential_secrets}}
+          Deduplicate aggressively across sources.
+          """)
+
+          headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+          payload = {
+              "model": model,
+              "messages": [{"role": "user", "content": prompt}],
+              "temperature": 0.1,
+              "response_format": {"type": "json_object"},
+          }
+          r = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=payload, timeout=300)
+          r.raise_for_status()
+          content = r.json()["choices"][0]["message"]["content"]
+          pathlib.Path("artifacts/consolidated_report.json").write_text(content, encoding="utf-8")
+          print("Consolidated report saved to artifacts/consolidated_report.json")
+          PY
+
+      - name: Optional dynamic analysis with MobSF Docker
+        if: ${{ inputs.enable_dynamic == true }}
+        run: |
+          docker run -d --name mobsf -p 8000:8000 opensecurity/mobile-security-framework-mobsf:latest
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:8000/api/v1/scans >/dev/null 2>&1; then break; fi
+            sleep 2
+          done
+          API_KEY=$(docker exec mobsf cat /home/mobsf/.MobSF/config.py 2>/dev/null | grep -oP 'API_KEY\s*=\s*"\K[^"]+' || true)
+          if [ -z "$API_KEY" ]; then API_KEY=""; fi
+          curl -s -X POST http://localhost:8000/api/v1/upload \
+            -H "Authorization: $API_KEY" \
+            -F "file=@artifacts/raw/target.apk" \
+            -o artifacts/mobsf_upload.json || true
+          HASH=$(jq -r '.hash // empty' artifacts/mobsf_upload.json 2>/dev/null || true)
+          if [ -n "$HASH" ]; then
+            curl -s -X POST http://localhost:8000/api/v1/scan \
+              -H "Authorization: $API_KEY" \
+              -d "hash=$HASH" \
+              -o artifacts/mobsf_static_report.json || true
+            curl -s -X POST http://localhost:8000/api/v1/dynamic/start_analysis \
+              -H "Authorization: $API_KEY" \
+              -d "hash=$HASH" \
+              -o artifacts/mobsf_dynamic_start.json || true
+            sleep 30
+            curl -s -X POST http://localhost:8000/api/v1/dynamic/report \
+              -H "Authorization: $API_KEY" \
+              -d "hash=$HASH" \
+              -o artifacts/mobsf_dynamic_report.json || true
+          fi
+          docker stop mobsf || true
+
+      - name: Generate summary
+        run: |
+          mkdir -p artifacts/summary
+          {
+            echo "# APK Analysis Summary"
+            echo "**APK URL:** ${{ inputs.apk_url }}"
+            echo "**SHA-256:** $(cat artifacts/raw/sha256.txt | awk '{print $1}')"
+            echo "**Java files decompiled:** $(cat artifacts/jadx/java_file_count.txt 2>/dev/null || echo 'N/A')"
+            echo "**Failed methods:** $(cat artifacts/jadx/failed_methods_count.txt 2>/dev/null || echo 'N/A')"
+            echo "**mobsfscan SARIF:** artifacts/mobsfscan.sarif"
+            echo "**Quark report:** artifacts/quark_report.json"
+            echo "**LLM findings:** artifacts/llm_findings.json"
+            echo "**Consolidated report:** artifacts/consolidated_report.json"
+          } > artifacts/summary/SUMMARY.md
+
+      - name: Upload all artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-analysis-artifacts
+          path: artifacts/
+          retention-days: 30
