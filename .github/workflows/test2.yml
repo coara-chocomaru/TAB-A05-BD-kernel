@@ -1,4 +1,4 @@
-name: APK Analysis Pipeline
+name: test
 on:
   workflow_dispatch:
     inputs:
@@ -41,14 +41,16 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq wget unzip curl jq openssl apktool aapt zipalign
+          sudo apt-get install -y -qq wget unzip curl jq openssl aapt zipalign
           pip install --quiet quark-engine mobsfscan requests openai
           wget -q https://github.com/skylot/jadx/releases/download/v1.5.6/jadx-1.5.6.zip -O /tmp/jadx.zip
           unzip -q /tmp/jadx.zip -d /opt/jadx
-          wget -q https://github.com/ThexXTURBOXx/dex2jar/releases/download/v2.1-SNAPSHOT/dex2jar-2.1-SNAPSHOT.zip -O /tmp/dex2jar.zip
+          wget -q https://github.com/ThexXTURBOXx/dex2jar/releases/download/v2.4.38/dex-tools-2.4.38.zip -O /tmp/dex2jar.zip
           unzip -q /tmp/dex2jar.zip -d /opt/dex2jar
+          wget -q https://github.com/iBotPeaches/Apktool/releases/download/v3.0.3/apktool_3.0.3.jar -O /opt/apktool.jar
           chmod +x /opt/jadx/bin/jadx
-          chmod +x /opt/dex2jar/*/d2j-dex2jar.sh
+          find /opt/dex2jar -name 'd2j-dex2jar.sh' -exec chmod +x {} \;
+          find /opt/dex2jar -name 'd2j-dex2jar' -exec chmod +x {} \; || true
 
       - name: Download APK
         env:
@@ -95,12 +97,16 @@ jobs:
 
       - name: apktool decode resources and manifest
         run: |
-          apktool d -f -o artifacts/apktool artifacts/raw/target.apk
+          java -jar /opt/apktool.jar d -f -o artifacts/apktool artifacts/raw/target.apk
 
       - name: dex2jar conversion
         run: |
           mkdir -p artifacts/dex2jar
           DEX2JAR_SCRIPT=$(find /opt/dex2jar -name 'd2j-dex2jar.sh' | head -n 1)
+          if [ -z "$DEX2JAR_SCRIPT" ]; then
+            echo "d2j-dex2jar.sh not found, skipping dex2jar conversion"
+            exit 0
+          fi
           for dex in $(unzip -Z1 artifacts/raw/target.apk | grep -E '^classes.*\.dex$'); do
             unzip -p artifacts/raw/target.apk "$dex" > /tmp/"$(basename "$dex")"
             "$DEX2JAR_SCRIPT" -f -o artifacts/dex2jar/"$(basename "$dex" .dex)".jar /tmp/"$(basename "$dex")"
@@ -132,7 +138,7 @@ jobs:
           LLM_MODEL: ${{ inputs.llm_model }}
         run: |
           python - <<'PY'
-          import os, json, pathlib, textwrap, requests
+          import os, pathlib, textwrap, requests
 
           api_key = os.environ.get("OPENAI_API_KEY")
           model = os.environ.get("LLM_MODEL", "gpt-4o")
@@ -189,7 +195,7 @@ jobs:
           LLM_MODEL: ${{ inputs.llm_model }}
         run: |
           python - <<'PY'
-          import os, json, pathlib, textwrap, requests
+          import os, pathlib, textwrap, requests
 
           api_key = os.environ.get("OPENAI_API_KEY")
           model = os.environ.get("LLM_MODEL", "gpt-4o")
