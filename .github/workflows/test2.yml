@@ -69,7 +69,7 @@ jobs:
           DEX2JAR_SCRIPT=$(find /opt/dex2jar -name 'd2j-dex2jar.sh' -print -quit)
           test -n "$DEX2JAR_SCRIPT" && echo "d2j-dex2jar.sh found at: $DEX2JAR_SCRIPT"
 
-      - name: Install Apktool JAR (fallback if apt version is old)
+      - name: Install Apktool JAR fallback
         run: |
           set -euo pipefail
           if ! command -v apktool >/dev/null 2>&1; then
@@ -112,6 +112,7 @@ jobs:
       - name: JADX decompile to Java
         run: |
           mkdir -p artifacts/jadx
+          set +e
           /opt/jadx/bin/jadx \
             --no-res \
             --show-bad-code \
@@ -119,22 +120,41 @@ jobs:
             --threads-count 4 \
             --log-level error \
             -d artifacts/jadx/java \
-            artifacts/raw/target.apk
+            artifacts/raw/target.apk 2>&1 | tee artifacts/jadx/jadx_decompile.log
+          JADX_EXIT=${PIPESTATUS[0]}
+          set -e
+          echo "JADX exit code: $JADX_EXIT"
           find artifacts/jadx/java -name '*.java' | wc -l | tee artifacts/jadx/java_file_count.txt
           grep -rl "Method not decompiled" artifacts/jadx/java --include=*.java | wc -l > artifacts/jadx/failed_methods_count.txt || true
+          grep -c "ERROR" artifacts/jadx/jadx_decompile.log > artifacts/jadx/jadx_error_count.txt || true
+          if [ "$JADX_EXIT" -ne 0 ]; then
+            echo "JADX reported decompilation errors (exit $JADX_EXIT). Partial output is preserved for analysis."
+          fi
 
       - name: JADX export Gradle project
         run: |
+          mkdir -p artifacts/jadx/gradle
+          set +e
           /opt/jadx/bin/jadx \
             --no-res \
             --export-gradle \
             --export-gradle-type android-app \
             -d artifacts/jadx/gradle \
-            artifacts/raw/target.apk
+            artifacts/raw/target.apk 2>&1 | tee artifacts/jadx/gradle_export.log
+          GRADLE_EXIT=${PIPESTATUS[0]}
+          set -e
+          echo "JADX gradle export exit code: $GRADLE_EXIT"
 
       - name: apktool decode resources and manifest
         run: |
-          apktool d -f -o artifacts/apktool artifacts/raw/target.apk
+          set +e
+          apktool d -f -o artifacts/apktool artifacts/raw/target.apk 2>&1 | tee artifacts/apktool_decode.log
+          APKTOOL_EXIT=${PIPESTATUS[0]}
+          set -e
+          echo "apktool exit code: $APKTOOL_EXIT"
+          if [ "$APKTOOL_EXIT" -ne 0 ]; then
+            echo "apktool reported errors (exit $APKTOOL_EXIT). Partial output may be available."
+          fi
 
       - name: dex2jar conversion
         run: |
@@ -146,20 +166,32 @@ jobs:
           fi
           for dex in $(unzip -Z1 artifacts/raw/target.apk | grep -E '^classes.*\.dex$'); do
             unzip -p artifacts/raw/target.apk "$dex" > /tmp/"$(basename "$dex")"
-            "$DEX2JAR_SCRIPT" -f -o artifacts/dex2jar/"$(basename "$dex" .dex)".jar /tmp/"$(basename "$dex")"
+            set +e
+            "$DEX2JAR_SCRIPT" -f -o artifacts/dex2jar/"$(basename "$dex" .dex)".jar /tmp/"$(basename "$dex")" 2>&1 | tee artifacts/dex2jar/"$(basename "$dex" .dex)".log
+            D2J_EXIT=${PIPESTATUS[0]}
+            set -e
+            echo "dex2jar exit code for $dex: $D2J_EXIT"
           done
 
       - name: mobsfscan static analysis
         run: |
+          set +e
           mobsfscan artifacts/raw/target.apk \
             --sarif \
             --output artifacts/mobsfscan.sarif \
             --json \
-            -o artifacts/mobsfscan.json || true
+            -o artifacts/mobsfscan.json 2>&1 | tee artifacts/mobsfscan.log
+          MOBSFSCAN_EXIT=${PIPESTATUS[0]}
+          set -e
+          echo "mobsfscan exit code: $MOBSFSCAN_EXIT"
 
       - name: Quark-Engine malware analysis
         run: |
-          quark -a artifacts/raw/target.apk -o artifacts/quark_report.json -s -t 300 || true
+          set +e
+          quark -a artifacts/raw/target.apk -o artifacts/quark_report.json -s -t 300 2>&1 | tee artifacts/quark.log
+          QUARK_EXIT=${PIPESTATUS[0]}
+          set -e
+          echo "Quark-Engine exit code: $QUARK_EXIT"
 
       - name: Extract strings and search indicators
         run: |
@@ -167,6 +199,7 @@ jobs:
           strings -n 6 artifacts/raw/target.apk > artifacts/strings/all_strings.txt
           grep -Eo 'https?://[^"'\'' ]+' artifacts/strings/all_strings.txt | sort -u > artifacts/strings/urls.txt || true
           grep -Ei 'api[_-]?key|secret|token|password|private[_-]?key|aws_|firebase|google_api' artifacts/strings/all_strings.txt | sort -u > artifacts/strings/secrets_candidates.txt || true
+          grep -Ei 'BEGIN (RSA|EC|DSA|OPENSSH) PRIVATE KEY' artifacts/strings/all_strings.txt | sort -u > artifacts/strings/private_keys.txt || true
 
       - name: LLM code review via OpenAI-compatible API
         if: ${{ inputs.llm_model != '' }}
@@ -248,6 +281,7 @@ jobs:
           llm = load("artifacts/llm_findings.json", "{}")
           urls = load("artifacts/strings/urls.txt", "")
           secrets = load("artifacts/strings/secrets_candidates.txt", "")
+          keys = load("artifacts/strings/private_keys.txt", "")
 
           prompt = textwrap.dedent(f"""
           You are aggregating multiple Android APK analysis sources.
@@ -257,11 +291,12 @@ jobs:
           - LLM code review JSON: {llm[:30000]}
           - Extracted URLs (sample): {urls[:8000]}
           - Secret candidates (sample): {secrets[:8000]}
+          - Private key candidates (sample): {keys[:4000]}
           Produce a single consolidated JSON report with:
           - meta: {{tool, timestamp, overall_risk}}
           - findings: array of unique findings with source(s), severity, confidence, description, remediation
           - attack_surface: {{exported_components, deep_links, native_libs}}
-          - secrets_and_urls: {{suspicious_urls, potential_secrets}}
+          - secrets_and_urls: {{suspicious_urls, potential_secrets, private_keys}}
           Deduplicate aggressively across sources.
           """)
 
@@ -320,6 +355,7 @@ jobs:
             echo "**SHA-256:** $(cat artifacts/raw/sha256.txt | awk '{print $1}')"
             echo "**Java files decompiled:** $(cat artifacts/jadx/java_file_count.txt 2>/dev/null || echo 'N/A')"
             echo "**Failed methods:** $(cat artifacts/jadx/failed_methods_count.txt 2>/dev/null || echo 'N/A')"
+            echo "**JADX error lines:** $(cat artifacts/jadx/jadx_error_count.txt 2>/dev/null || echo 'N/A')"
             echo "**mobsfscan SARIF:** artifacts/mobsfscan.sarif"
             echo "**Quark report:** artifacts/quark_report.json"
             echo "**LLM findings:** artifacts/llm_findings.json"
