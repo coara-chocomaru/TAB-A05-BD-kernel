@@ -1,84 +1,53 @@
-name: magiskboot-android-source
+name: Patch LK Image with Cert Bypass
 
 on:
-  schedule:
-    - cron: '0 3 * * *'  # nightly 03:00 UTC
-  push:
-    branches: [main, master]
-  pull_request:
-    branches: [main, master]
   workflow_dispatch:
     inputs:
-      magisk_ref:
-        description: 'Magisk branch/tag/SHA to fetch (default: master)'
+      lk_img_url:
+        description: 'URL of the LK image to patch (required)'
+        required: true
+        type: string
+      output_name:
+        description: 'Name for the patched image file'
         required: false
-        default: 'master'
-
-permissions:
-  contents: read
+        default: 'patched_lk.img'
+        type: string
+      bypass_mode:
+        description: 'Certificate bypass mode'
+        required: false
+        default: 'override'
+        type: choice
+        options:
+          - override
+          - wrap
 
 jobs:
-  source:
-    name: Package magiskboot Android source (no build)
-    runs-on: ubuntu-24.04
-    outputs:
-      magisk_sha: ${{ steps.clone.outputs.magisk_sha }}
+  patch-lk:
+    runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
 
-      - name: Clone upstream Magisk (Android source)
-        id: clone
-        env:
-          MAGISK_REF: ${{ inputs.magisk_ref || 'master' }}
-        shell: bash
+      - name: Install lkpatcher
         run: |
-          if ! git clone --depth 1 --recurse-submodules --shallow-submodules --branch "$MAGISK_REF" https://github.com/topjohnwu/Magisk.git upstream; then
-            git clone https://github.com/topjohnwu/Magisk.git upstream
-            git -C upstream checkout "$MAGISK_REF"
-            git -C upstream submodule update --init --recursive --depth 1
-          else
-            git -C upstream submodule update --init --recursive --depth 1 || true
-          fi
-          SHA=$(git -C upstream rev-parse --short HEAD)
-          echo "magisk_sha=$SHA" >> $GITHUB_OUTPUT
-          echo "MAGISK_SHA=$SHA" >> $GITHUB_ENV
-          echo "Upstream: $(git -C upstream log -1 --oneline)"
-          echo "Source size:"
-          du -sh upstream
+          pip install --upgrade pip
+          pip install git+https://github.com/R0rt1z2/lkpatcher
 
-      - name: Create source archive (zip only, no build)
-        shell: bash
+      - name: Download LK image
         run: |
-          mkdir -p out
-          cd upstream
+          curl -L -o lk.img "${{ inputs.lk_img_url }}"
 
-          # Keep only the pieces actually needed to build magiskboot for Android.
-          # Everything else (docs, website assets, .git metadata) is stripped to keep
-          # the artifact small. Adjust the list below if you need more.
-          mkdir -p ../stage
-          # native tree (C++ + Rust magiskboot crate, cargo config, submodules)
-          cp -a native      ../stage/ 2>/dev/null || true
-          # build entrypoint + helper scripts (build.py drives NDK / cargo build)
-          cp -a build.py    ../stage/ 2>/dev/null || true
-          cp -a scripts     ../stage/ 2>/dev/null || true
-          cp -a tools       ../stage/ 2>/dev/null || true
-          # top-level gradle/project metadata (harmless, useful context)
-          cp -a gradle*     ../stage/ 2>/dev/null || true
-          cp -a '*.gradle.kts' '*.properties' '*.md' 'LICENSE' 2>/dev/null ../stage/ || true
+      - name: Apply certificate bypass
+        run: |
+          python -m lkpatcher lk.img \
+            -o "${{ inputs.output_name }}" \
+            --cert-bypass ${{ inputs.bypass_mode }}
 
-          cd ..
-          NAME="magiskboot-android-source-${MAGISK_SHA}.zip"
-          ( cd stage && zip -r -9 "../out/${NAME}" . )
-          rm -rf stage
-
-          echo "Archive contents (top):"
-          unzip -l "out/${NAME}" | head -40
-          ls -lh out/
-
-      - name: Upload source zip
+      - name: Upload patched image
         uses: actions/upload-artifact@v4
         with:
-          name: magiskboot-android-source-${{ steps.clone.outputs.magisk_sha }}
-          path: out/*.zip
-          if-no-files-found: error
-          retention-days: 30
+          name: patched-lk
+          path: ${{ inputs.output_name }}
