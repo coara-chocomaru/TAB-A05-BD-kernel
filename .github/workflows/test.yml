@@ -1,0 +1,84 @@
+name: magiskboot-android-source
+
+on:
+  schedule:
+    - cron: '0 3 * * *'  # nightly 03:00 UTC
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      magisk_ref:
+        description: 'Magisk branch/tag/SHA to fetch (default: master)'
+        required: false
+        default: 'master'
+
+permissions:
+  contents: read
+
+jobs:
+  source:
+    name: Package magiskboot Android source (no build)
+    runs-on: ubuntu-24.04
+    outputs:
+      magisk_sha: ${{ steps.clone.outputs.magisk_sha }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Clone upstream Magisk (Android source)
+        id: clone
+        env:
+          MAGISK_REF: ${{ inputs.magisk_ref || 'master' }}
+        shell: bash
+        run: |
+          if ! git clone --depth 1 --recurse-submodules --shallow-submodules --branch "$MAGISK_REF" https://github.com/topjohnwu/Magisk.git upstream; then
+            git clone https://github.com/topjohnwu/Magisk.git upstream
+            git -C upstream checkout "$MAGISK_REF"
+            git -C upstream submodule update --init --recursive --depth 1
+          else
+            git -C upstream submodule update --init --recursive --depth 1 || true
+          fi
+          SHA=$(git -C upstream rev-parse --short HEAD)
+          echo "magisk_sha=$SHA" >> $GITHUB_OUTPUT
+          echo "MAGISK_SHA=$SHA" >> $GITHUB_ENV
+          echo "Upstream: $(git -C upstream log -1 --oneline)"
+          echo "Source size:"
+          du -sh upstream
+
+      - name: Create source archive (zip only, no build)
+        shell: bash
+        run: |
+          mkdir -p out
+          cd upstream
+
+          # Keep only the pieces actually needed to build magiskboot for Android.
+          # Everything else (docs, website assets, .git metadata) is stripped to keep
+          # the artifact small. Adjust the list below if you need more.
+          mkdir -p ../stage
+          # native tree (C++ + Rust magiskboot crate, cargo config, submodules)
+          cp -a native      ../stage/ 2>/dev/null || true
+          # build entrypoint + helper scripts (build.py drives NDK / cargo build)
+          cp -a build.py    ../stage/ 2>/dev/null || true
+          cp -a scripts     ../stage/ 2>/dev/null || true
+          cp -a tools       ../stage/ 2>/dev/null || true
+          # top-level gradle/project metadata (harmless, useful context)
+          cp -a gradle*     ../stage/ 2>/dev/null || true
+          cp -a '*.gradle.kts' '*.properties' '*.md' 'LICENSE' 2>/dev/null ../stage/ || true
+
+          cd ..
+          NAME="magiskboot-android-source-${MAGISK_SHA}.zip"
+          ( cd stage && zip -r -9 "../out/${NAME}" . )
+          rm -rf stage
+
+          echo "Archive contents (top):"
+          unzip -l "out/${NAME}" | head -40
+          ls -lh out/
+
+      - name: Upload source zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: magiskboot-android-source-${{ steps.clone.outputs.magisk_sha }}
+          path: out/*.zip
+          if-no-files-found: error
+          retention-days: 30
