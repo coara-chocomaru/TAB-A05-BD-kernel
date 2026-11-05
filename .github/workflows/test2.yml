@@ -201,6 +201,33 @@ jobs:
           grep -Ei 'api[_-]?key|secret|token|password|private[_-]?key|aws_|firebase|google_api' artifacts/strings/all_strings.txt | sort -u > artifacts/strings/secrets_candidates.txt || true
           grep -Ei 'BEGIN (RSA|EC|DSA|OPENSSH) PRIVATE KEY' artifacts/strings/all_strings.txt | sort -u > artifacts/strings/private_keys.txt || true
 
+      - name: Grep keywords in decompiled Java
+        run: |
+          mkdir -p artifacts/grep_results
+          if [ ! -d artifacts/jadx/java ]; then
+            echo "artifacts/jadx/java not found, skipping keyword grep."
+            exit 0
+          fi
+          OUT_DIR="$GITHUB_WORKSPACE/artifacts/grep_results"
+          : > "$OUT_DIR/counts.txt"
+          : > "$OUT_DIR/all_matches.txt"
+          for kw in "lock" "unlock" "password" "hidden" "sdcard/" "debug" "_code"; do
+            safe_kw=$(printf '%s' "$kw" | tr '/' '_')
+            out="$OUT_DIR/${safe_kw}_matches.txt"
+            grep -rin --include='*.java' -F "$kw" artifacts/jadx/java > "$out" 2>/dev/null || true
+            count=$(wc -l < "$out" | tr -d ' ')
+            printf '%s: %s\n' "$kw" "$count" >> "$OUT_DIR/counts.txt"
+            if [ "$count" -gt 0 ]; then
+              {
+                echo ""
+                echo "===== KEYWORD: $kw ($count matches) ====="
+                cat "$out"
+              } >> "$OUT_DIR/all_matches.txt"
+            fi
+          done
+          echo "Keyword grep summary:"
+          cat "$OUT_DIR/counts.txt"
+
       - name: LLM code review via OpenAI-compatible API
         if: ${{ inputs.llm_model != '' }}
         env:
@@ -282,6 +309,8 @@ jobs:
           urls = load("artifacts/strings/urls.txt", "")
           secrets = load("artifacts/strings/secrets_candidates.txt", "")
           keys = load("artifacts/strings/private_keys.txt", "")
+          grep_counts = load("artifacts/grep_results/counts.txt", "")
+          grep_all = load("artifacts/grep_results/all_matches.txt", "")
 
           prompt = textwrap.dedent(f"""
           You are aggregating multiple Android APK analysis sources.
@@ -292,11 +321,14 @@ jobs:
           - Extracted URLs (sample): {urls[:8000]}
           - Secret candidates (sample): {secrets[:8000]}
           - Private key candidates (sample): {keys[:4000]}
+          - Keyword grep counts: {grep_counts[:2000]}
+          - Keyword grep matches (sample): {grep_all[:20000]}
           Produce a single consolidated JSON report with:
           - meta: {{tool, timestamp, overall_risk}}
           - findings: array of unique findings with source(s), severity, confidence, description, remediation
           - attack_surface: {{exported_components, deep_links, native_libs}}
           - secrets_and_urls: {{suspicious_urls, potential_secrets, private_keys}}
+          - keyword_hits: {{lock, unlock, password, hidden, sdcard, debug, _code}}
           Deduplicate aggressively across sources.
           """)
 
@@ -346,34 +378,6 @@ jobs:
           fi
           docker stop mobsf || true
 
-      - name: Grep keywords from JADX output
-        run: |
-          mkdir -p artifacts/grep_results
-          if [ ! -d artifacts/jadx/java ]; then
-            echo "artifacts/jadx/java not found, skipping keyword grep."
-            exit 0
-          fi
-          cd artifacts/jadx/java
-          : > ../grep_results/counts.txt
-          : > ../grep_results/all_matches.txt
-          for kw in "lock" "unlock" "password" "hidden" "sdcard/" "debug" "_code"; do
-            safe_kw=$(printf '%s' "$kw" | tr '/' '_')
-            out="../grep_results/${safe_kw}_matches.txt"
-            grep -rin --include='*.java' -F "$kw" . > "$out" 2>/dev/null || true
-            count=$(wc -l < "$out" | tr -d ' ')
-            printf '%s: %s\n' "$kw" "$count" >> ../grep_results/counts.txt
-            if [ "$count" -gt 0 ]; then
-              {
-                echo ""
-                echo "===== KEYWORD: $kw ($count matches) ====="
-                cat "$out"
-              } >> ../grep_results/all_matches.txt
-            fi
-          done
-          cd - >/dev/null
-          echo "Keyword grep summary:"
-          cat artifacts/grep_results/counts.txt
-
       - name: Generate summary
         run: |
           mkdir -p artifacts/summary
@@ -384,17 +388,11 @@ jobs:
             echo "**Java files decompiled:** $(cat artifacts/jadx/java_file_count.txt 2>/dev/null || echo 'N/A')"
             echo "**Failed methods:** $(cat artifacts/jadx/failed_methods_count.txt 2>/dev/null || echo 'N/A')"
             echo "**JADX error lines:** $(cat artifacts/jadx/jadx_error_count.txt 2>/dev/null || echo 'N/A')"
-            echo ""
-            echo "## Keyword Grep Counts"
-            cat artifacts/grep_results/counts.txt 2>/dev/null || echo "N/A"
-            echo ""
-            echo "## Artifacts"
-            echo "- mobsfscan SARIF: artifacts/mobsfscan.sarif"
-            echo "- Quark report: artifacts/quark_report.json"
-            echo "- LLM findings: artifacts/llm_findings.json"
-            echo "- Consolidated report: artifacts/consolidated_report.json"
-            echo "- Keyword matches (per keyword): artifacts/grep_results/*_matches.txt"
-            echo "- Keyword matches (combined): artifacts/grep_results/all_matches.txt"
+            echo "**mobsfscan SARIF:** artifacts/mobsfscan.sarif"
+            echo "**Quark report:** artifacts/quark_report.json"
+            echo "**Keyword grep counts:** artifacts/grep_results/counts.txt"
+            echo "**LLM findings:** artifacts/llm_findings.json"
+            echo "**Consolidated report:** artifacts/consolidated_report.json"
           } > artifacts/summary/SUMMARY.md
 
       - name: Upload all artifacts
