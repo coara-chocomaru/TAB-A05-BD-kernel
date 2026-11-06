@@ -80,14 +80,13 @@ jobs:
         run: |
           set -euo pipefail
 
-          kheader="include/linux/netfilter/xt_mark.h"
-          if [ ! -f "$kheader" ]; then
-            mkdir -p "$(dirname "$kheader")"
-            cat > "$kheader" << 'EOF'
-          #ifndef _XT_MARK_H
-          #define _XT_MARK_H
-
-          #include <uapi/linux/netfilter/xt_mark.h>
+          uheader="include/uapi/linux/netfilter/xt_mark.h"
+          if [ ! -f "$uheader" ]; then
+            mkdir -p "$(dirname "$uheader")"
+            cat > "$uheader" << 'EOF'
+          #ifndef _UAPI_XT_MARK_H
+          #define _UAPI_XT_MARK_H
+          #include <linux/types.h>
 
           struct xt_mark_tginfo2 {
           	__u32 mark, mask;
@@ -98,84 +97,31 @@ jobs:
           	__u8 invert;
           };
 
-          #endif /* _XT_MARK_H */
+          #endif /* _UAPI_XT_MARK_H */
           EOF
           else
-            if ! grep -q "struct xt_mark_tginfo2" "$kheader"; then
-              cat >> "$kheader" << 'EOF'
-
-          #ifndef XT_MARK_TGINFO2_DEFINED
-          #define XT_MARK_TGINFO2_DEFINED
-          struct xt_mark_tginfo2 {
-          	__u32 mark, mask;
-          };
-          #endif
-
-          #ifndef XT_MARK_MTINFO1_DEFINED
-          #define XT_MARK_MTINFO1_DEFINED
-          struct xt_mark_mtinfo1 {
-          	__u32 mark, mask;
-          	__u8 invert;
-          };
-          #endif
-          EOF
-            fi
-          fi
-
-          src="net/netfilter/xt_mark.c"
-          if [ -f "$src" ] && ! grep -q "XT_MARK_FALLBACK_DEFINED" "$src"; then
-            python3 - "$src" << 'PYEOF'
-          import sys
-          path = sys.argv[1]
-          with open(path) as f:
-              lines = f.readlines()
-          block = []
-          block.append("\n/* XT_MARK_FALLBACK_DEFINED: fallback struct definitions */\n")
-          block.append("#ifndef XT_MARK_TGINFO2_DEFINED\n")
-          block.append("#define XT_MARK_TGINFO2_DEFINED\n")
-          block.append("struct xt_mark_tginfo2 { __u32 mark, mask; };\n")
-          block.append("#endif\n")
-          block.append("#ifndef XT_MARK_MTINFO1_DEFINED\n")
-          block.append("#define XT_MARK_MTINFO1_DEFINED\n")
-          block.append("struct xt_mark_mtinfo1 { __u32 mark, mask; __u8 invert; };\n")
-          block.append("#endif\n\n")
-          out = []
-          inserted = False
-          for line in lines:
-              out.append(line)
-              if not inserted and line.lstrip().startswith("#include"):
-                  # 最後の連続した #include の後ろに挿入
-                  pass
-          # 最後の #include 行を探す
-          last_inc = -1
-          for i, line in enumerate(out):
-              if line.lstrip().startswith("#include"):
-                  last_inc = i
-          if last_inc >= 0:
-              out = out[:last_inc + 1] + block + out[last_inc + 1:]
-              inserted = True
-          if not inserted:
-              out = block + out
-          with open(path, "w") as f:
-              f.writelines(out)
-          PYEOF
-          fi
-
-          uheader="include/uapi/linux/netfilter/xt_mark.h"
-          if [ -f "$uheader" ]; then
             if ! grep -q "struct xt_mark_tginfo2" "$uheader"; then
               cat >> "$uheader" << 'EOF'
 
           #ifndef _UAPI_XT_MARK_FALLBACK
           #define _UAPI_XT_MARK_FALLBACK
-          #ifdef __KERNEL__
           struct xt_mark_tginfo2 { __u32 mark, mask; };
           struct xt_mark_mtinfo1 { __u32 mark, mask; __u8 invert; };
-          #endif
           #endif
           EOF
             fi
           fi
+
+          kheader="include/linux/netfilter/xt_mark.h"
+          mkdir -p "$(dirname "$kheader")"
+          cat > "$kheader" << 'EOF'
+          #ifndef _XT_MARK_H
+          #define _XT_MARK_H
+
+          #include <uapi/linux/netfilter/xt_mark.h>
+
+          #endif /* _XT_MARK_H */
+          EOF
 
       - name: Build kernel image and dtbs
         working-directory: ${{ env.KERNEL_DIR }}
